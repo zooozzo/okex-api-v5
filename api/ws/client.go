@@ -14,11 +14,9 @@ import (
 	"time"
 
 	"github.com/cocoyes/okex"
-
+	"github.com/cocoyes/okex/events"
 	"github.com/go-logr/logr"
 	"github.com/gorilla/websocket"
-
-	"github.com/cocoyes/okex/events"
 )
 
 const (
@@ -28,9 +26,6 @@ const (
 	PingPeriod = 15 * time.Second
 )
 
-// ClientWs is the websocket api client
-//
-// https://www.okex.com/docs-v5/en/#websocket-api
 type ClientWs struct {
 	url           map[bool]okex.BaseURL
 	apiKey        string
@@ -54,12 +49,11 @@ type ClientWs struct {
 	Public        *Public
 	Trade         *Trade
 	log           logr.Logger
-	lock          sync.RWMutex
+	lock          sync.RWMutex // 一把大锁保护所有 map
 }
 
 type ClientOption func(c *ClientWs)
 
-// NewClient returns a pointer to a fresh ClientWs
 func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url map[bool]okex.BaseURL, opts ...ClientOption) *ClientWs {
 	ctx, cancel := context.WithCancel(ctx)
 	c := &ClientWs{
@@ -87,30 +81,22 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 	return c
 }
 
-// Connect into the server
-//
-// https://www.okex.com/docs-v5/en/#websocket-api-connect
 func (c *ClientWs) Connect(p bool) error {
-	c.lock.Lock()
-	if c.conn == nil {
-		c.conn = make(map[bool]*websocket.Conn)
-	}
-	if c.url == nil {
-		c.url = make(map[bool]okex.BaseURL)
-	}
-	// 如果已连过，直接放行
-	if c.conn[p] != nil {
-		c.lock.Unlock()
+	c.lock.RLock()
+	conn := c.conn[p]
+	c.lock.RUnlock()
+	if conn != nil {
 		return nil
 	}
-	c.lock.Unlock()
-	// 下面并不需要锁，因为 dial() 里会在内部加锁保护 map
+	return c.dialRetry(p)
+}
+
+func (c *ClientWs) dialRetry(p bool) error {
 	err := c.dial(p)
 	if err == nil {
 		return nil
 	}
 	c.log.Error(err, "failed to dial ws connection")
-
 	ticker := time.NewTicker(redialTick)
 	defer ticker.Stop()
 	counter := 0
@@ -129,23 +115,24 @@ func (c *ClientWs) Connect(p bool) error {
 	}
 }
 
-// CheckConnect into the server
 func (c *ClientWs) CheckConnect(p bool) bool {
-	if c.conn[p] != nil {
-		return true
-	}
-	return false
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.conn[p] != nil
 }
 
-// Login
-//
-// https://www.okex.com/docs-v5/en/#websocket-api-login
 func (c *ClientWs) Login() error {
-	if c.Authorized {
+	c.lock.RLock()
+	authorized := c.Authorized
+	c.lock.RUnlock()
+	if authorized {
 		return nil
 	}
 
-	if c.AuthRequested != nil && time.Since(*c.AuthRequested).Seconds() < 30 {
+	c.lock.RLock()
+	ar := c.AuthRequested
+	c.lock.RUnlock()
+	if ar != nil && time.Since(*ar).Seconds() < 30 {
 		return nil
 	}
 
@@ -168,10 +155,6 @@ func (c *ClientWs) Login() error {
 	return c.Send(true, okex.LoginOperation, args)
 }
 
-// Subscribe
-// Users can choose to subscribe to one or more channels, and the total length of multiple channels cannot exceed 4096 bytes.
-//
-// https://www.okex.com/docs-v5/en/#websocket-api-subscribe
 func (c *ClientWs) Subscribe(p bool, ch []okex.ChannelName, args map[string]string) error {
 	count := 1
 	if len(ch) != 0 {
@@ -192,9 +175,6 @@ func (c *ClientWs) Subscribe(p bool, ch []okex.ChannelName, args map[string]stri
 	return c.Send(p, okex.SubscribeOperation, tmpArgs)
 }
 
-// Unsubscribe into channel(s)
-//
-// https://www.okex.com/docs-v5/en/#websocket-api-unsubscribe
 func (c *ClientWs) Unsubscribe(p bool, ch []okex.ChannelName, args map[string]string) error {
 	tmpArgs := make([]map[string]string, len(ch))
 	for i, name := range ch {
@@ -208,7 +188,6 @@ func (c *ClientWs) Unsubscribe(p bool, ch []okex.ChannelName, args map[string]st
 	return c.Send(p, okex.UnsubscribeOperation, tmpArgs)
 }
 
-// Send message through either connections
 func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, extras ...map[string]string) error {
 	if op != okex.LoginOperation {
 		err := c.Connect(p)
@@ -240,12 +219,17 @@ func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, ext
 		return err
 	}
 
-	c.sendChan[p] <- j
+	c.lock.RLock()
+	ch := c.sendChan[p]
+	c.lock.RUnlock()
+	if ch == nil {
+		return errors.New("sendChan is nil")
+	}
+	ch <- j
 
 	return nil
 }
 
-// SetChannels to receive certain events on separate channel
 func (c *ClientWs) SetChannels(errCh chan *events.Error, subCh chan *events.Subscribe, unSub chan *events.Unsubscribe, lCh chan *events.Login, sCh chan *events.Success) {
 	c.ErrChan = errCh
 	c.SubscribeChan = subCh
@@ -254,7 +238,6 @@ func (c *ClientWs) SetChannels(errCh chan *events.Error, subCh chan *events.Subs
 	c.SuccessChan = sCh
 }
 
-// WaitForAuthorization waits for the auth response and try to log in if it was needed
 func (c *ClientWs) WaitForAuthorization() error {
 	c.lock.RLock()
 	if c.Authorized {
@@ -283,7 +266,6 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) dial(p bool) error {
-	// 连接建立
 	c.lock.Lock()
 	if c.conn == nil {
 		c.conn = make(map[bool]*websocket.Conn)
@@ -293,6 +275,9 @@ func (c *ClientWs) dial(p bool) error {
 	}
 	if c.lastTransmit == nil {
 		c.lastTransmit = make(map[bool]*time.Time)
+	}
+	if _, ok := c.sendChan[p]; !ok || c.sendChan[p] == nil {
+		c.sendChan[p] = make(chan []byte, 3)
 	}
 	c.lock.Unlock()
 
@@ -315,13 +300,11 @@ func (c *ClientWs) dial(p bool) error {
 	}
 	defer res.Body.Close()
 
-	// 存conn
 	c.lock.Lock()
 	c.conn[p] = conn
 	c.lock.Unlock()
 	c.mu[p].Unlock()
 
-	// 启动receiver
 	go func() {
 		defer func() {
 			c.Cancel()
@@ -331,6 +314,11 @@ func (c *ClientWs) dial(p bool) error {
 				c.conn[p].Close()
 				delete(c.conn, p)
 			}
+			if c.sendChan[p] != nil {
+				close(c.sendChan[p])
+				delete(c.sendChan, p)
+			}
+			delete(c.lastTransmit, p)
 			c.lock.Unlock()
 			c.mu[p].Unlock()
 		}()
@@ -342,7 +330,6 @@ func (c *ClientWs) dial(p bool) error {
 		}
 	}()
 
-	// 启动sender
 	go func() {
 		defer func() {
 			c.Cancel()
@@ -352,6 +339,11 @@ func (c *ClientWs) dial(p bool) error {
 				c.conn[p].Close()
 				delete(c.conn, p)
 			}
+			if c.sendChan[p] != nil {
+				close(c.sendChan[p])
+				delete(c.sendChan, p)
+			}
+			delete(c.lastTransmit, p)
 			c.lock.Unlock()
 			c.mu[p].Unlock()
 		}()
@@ -374,6 +366,9 @@ func (c *ClientWs) sender(p bool) error {
 		c.lock.RLock()
 		dataChan := c.sendChan[p]
 		c.lock.RUnlock()
+		if dataChan == nil {
+			return errors.New("sendChan is nil")
+		}
 
 		select {
 		case data := <-dataChan:
@@ -383,7 +378,7 @@ func (c *ClientWs) sender(p bool) error {
 			if conn == nil {
 				return errors.New("conn is nil")
 			}
-			err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			err := conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err != nil {
 				return err
 			}
@@ -402,15 +397,16 @@ func (c *ClientWs) sender(p bool) error {
 			conn := c.conn[p]
 			last := c.lastTransmit[p]
 			c.lock.RUnlock()
-			if conn != nil && (last == nil || (last != nil && time.Since(*last) > time.Second*5)) {
-				go func() {
-					c.lock.RLock()
-					dataChan := c.sendChan[p]
-					c.lock.RUnlock()
-					if dataChan != nil {
-						dataChan <- []byte("ping")
+			if conn != nil && (last == nil || (last != nil && time.Since(*last) > PingPeriod)) {
+				c.lock.RLock()
+				dataChan := c.sendChan[p]
+				c.lock.RUnlock()
+				if dataChan != nil {
+					select {
+					case dataChan <- []byte("ping"):
+					default:
 					}
-				}()
+				}
 			}
 		case <-c.ctx.Done():
 			return nil
@@ -430,7 +426,7 @@ func (c *ClientWs) receiver(p bool) error {
 			if conn == nil {
 				return errors.New("conn is nil")
 			}
-			err := conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			err := conn.SetReadDeadline(time.Now().Add(pongWait))
 			if err != nil {
 				return err
 			}
@@ -468,11 +464,9 @@ func (c *ClientWs) handleCancel(msg string) error {
 	go func() {
 		c.DoneChan <- msg
 	}()
-
 	return fmt.Errorf("operation cancelled: %s", msg)
 }
 
-// TODO: break each case into a separate function
 func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 	switch e.Event {
 	case "error":
@@ -483,7 +477,6 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 				c.ErrChan <- &e
 			}
 		}()
-
 		return true
 	case "subscribe":
 		e := events.Subscribe{}
@@ -491,7 +484,6 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 		if c.SubscribeChan != nil {
 			c.SubscribeChan <- &e
 		}
-
 		return true
 	case "unsubscribe":
 		e := events.Unsubscribe{}
@@ -501,7 +493,6 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 				c.UnsubscribeCh <- &e
 			}
 		}()
-
 		return true
 	case "login":
 		c.lock.RLock()
@@ -514,11 +505,9 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 			_ = c.Login()
 			break
 		}
-		// 写授权状态
 		c.lock.Lock()
 		c.Authorized = true
 		c.lock.Unlock()
-
 		e := events.Login{}
 		_ = json.Unmarshal(data, &e)
 		go func() {
@@ -526,40 +515,30 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 				c.LoginChan <- &e
 			}
 		}()
-
 		return true
 	}
-
 	if c.Private.Process(data, e) {
 		return true
 	}
-
 	if c.Public.Process(data, e) {
 		return true
 	}
-
 	if e.ID != "" {
 		if e.Code != 0 {
 			ee := *e
 			ee.Event = "error"
-
 			return c.process(data, &ee)
 		}
-
 		e := events.Success{}
 		_ = json.Unmarshal(data, &e)
-
 		if c.SuccessChan != nil {
 			c.SuccessChan <- &e
 		}
-
 		return true
 	}
-
 	return false
 }
 
-// WithLogger option sets new logger for websocket client
 func WithLogger(sink logr.LogSink) ClientOption {
 	return func(c *ClientWs) {
 		c.log = c.log.WithSink(sink)
