@@ -90,10 +90,20 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 //
 // https://www.okex.com/docs-v5/en/#websocket-api-connect
 func (c *ClientWs) Connect(p bool) error {
+	c.lock.Lock()
+	if c.conn == nil {
+		c.conn = make(map[bool]*websocket.Conn)
+	}
+	if c.url == nil {
+		c.url = make(map[bool]okex.BaseURL)
+	}
+	// 如果已连过，直接放行
 	if c.conn[p] != nil {
+		c.lock.Unlock()
 		return nil
 	}
-
+	c.lock.Unlock()
+	// 下面并不需要锁，因为 dial() 里会在内部加锁保护 map
 	err := c.dial(p)
 	if err == nil {
 		return nil
@@ -272,6 +282,24 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) dial(p bool) error {
+	c.lock.Lock()
+	// 确保 mu, conn, sendChan, lastTransmit map 已初始化
+	if c.mu == nil {
+		c.mu = make(map[bool]*sync.RWMutex)
+	}
+	if c.mu[p] == nil {
+		c.mu[p] = &sync.RWMutex{}
+	}
+	if c.sendChan == nil {
+		c.sendChan = make(map[bool]chan []byte)
+	}
+	if c.sendChan[p] == nil {
+		c.sendChan[p] = make(chan []byte, 1024)
+	}
+	if c.lastTransmit == nil {
+		c.lastTransmit = make(map[bool]*time.Time)
+	}
+	// 切换到 p 维度的细锁，放在全局锁之下
 	c.mu[p].Lock()
 	conn, res, err := websocket.DefaultDialer.Dial(string(c.url[p]), nil)
 	if err != nil {
@@ -281,7 +309,7 @@ func (c *ClientWs) dial(p bool) error {
 		}
 
 		c.mu[p].Unlock()
-
+		c.lock.Unlock()
 		return fmt.Errorf("error %d: %w", statusCode, err)
 	}
 	defer res.Body.Close()
@@ -329,6 +357,7 @@ func (c *ClientWs) dial(p bool) error {
 
 	c.conn[p] = conn
 	c.mu[p].Unlock()
+	c.lock.Unlock()
 
 	return nil
 }
