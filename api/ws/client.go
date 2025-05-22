@@ -282,82 +282,66 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) dial(p bool) error {
-	c.lock.Lock()
-	// 确保 mu, conn, sendChan, lastTransmit map 已初始化
-	if c.mu == nil {
-		c.mu = make(map[bool]*sync.RWMutex)
-	}
-	if c.mu[p] == nil {
-		c.mu[p] = &sync.RWMutex{}
-	}
-	if c.sendChan == nil {
-		c.sendChan = make(map[bool]chan []byte)
-	}
-	if c.sendChan[p] == nil {
-		c.sendChan[p] = make(chan []byte, 1024)
-	}
-	if c.lastTransmit == nil {
-		c.lastTransmit = make(map[bool]*time.Time)
-	}
-	// 切换到 p 维度的细锁，放在全局锁之下
+	// 先用 p 维度的细锁保护连接建立
 	c.mu[p].Lock()
 	conn, res, err := websocket.DefaultDialer.Dial(string(c.url[p]), nil)
 	if err != nil {
-		var statusCode int
+		statusCode := 0
 		if res != nil {
 			statusCode = res.StatusCode
 		}
-
 		c.mu[p].Unlock()
-		c.lock.Unlock()
 		return fmt.Errorf("error %d: %w", statusCode, err)
 	}
 	defer res.Body.Close()
-	c.log.Info("response ws", "status", res.Status)
 
+	// receiver 在全局锁下运行，避免与其它map写并发冲突
 	go func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+
 		defer func() {
-			// Cleaning the connection with ws
 			c.Cancel()
 			c.mu[p].Lock()
-			c.conn[p].Close()
+			if c.conn[p] != nil {
+				c.conn[p].Close()
+			}
 			c.mu[p].Unlock()
 		}()
-		err := c.receiver(p)
-		if err != nil {
+
+		if err := c.receiver(p); err != nil {
 			if !strings.Contains(err.Error(), "operation cancelled: receiver") {
-				c.ErrChan <- &events.Error{
-					Event: "error",
-					Msg:   err.Error(),
-				}
+				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
 			}
 			c.log.Error(err, "receiver error")
 		}
 	}()
 
+	// sender 也包全局锁
 	go func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+
 		defer func() {
-			// Cleaning the connection with ws
 			c.Cancel()
 			c.mu[p].Lock()
-			c.conn[p].Close()
+			if c.conn[p] != nil {
+				c.conn[p].Close()
+			}
 			c.mu[p].Unlock()
 		}()
-		err := c.sender(p)
-		if err != nil {
+
+		if err := c.sender(p); err != nil {
 			if !strings.Contains(err.Error(), "operation cancelled: sender") {
-				c.ErrChan <- &events.Error{
-					Event: "error",
-					Msg:   err.Error(),
-				}
+				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
 			}
 			c.log.Error(err, "sender error")
 		}
 	}()
 
+	// 最后把 conn 写回 map，并释放细锁
 	c.conn[p] = conn
 	c.mu[p].Unlock()
-	c.lock.Unlock()
 
 	return nil
 }
