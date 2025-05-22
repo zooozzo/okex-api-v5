@@ -282,66 +282,67 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) dial(p bool) error {
-	// 先用 p 维度的细锁保护连接建立
+	// 步骤1：防止同一类型并发拨号
 	c.mu[p].Lock()
+	defer c.mu[p].Unlock()
+
+	// 步骤2：建立连接
 	conn, res, err := websocket.DefaultDialer.Dial(string(c.url[p]), nil)
 	if err != nil {
 		statusCode := 0
 		if res != nil {
 			statusCode = res.StatusCode
 		}
-		c.mu[p].Unlock()
 		return fmt.Errorf("error %d: %w", statusCode, err)
 	}
-	defer res.Body.Close()
+	if res != nil {
+		defer res.Body.Close()
+	}
 
-	// receiver 在全局锁下运行，避免与其它map写并发冲突
-	go func() {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-
-		defer func() {
-			c.Cancel()
-			c.mu[p].Lock()
-			if c.conn[p] != nil {
-				c.conn[p].Close()
-			}
-			c.mu[p].Unlock()
-		}()
-
-		if err := c.receiver(p); err != nil {
-			if !strings.Contains(err.Error(), "operation cancelled: receiver") {
-				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
-			}
-			c.log.Error(err, "receiver error")
-		}
-	}()
-
-	// sender 也包全局锁
-	go func() {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-
-		defer func() {
-			c.Cancel()
-			c.mu[p].Lock()
-			if c.conn[p] != nil {
-				c.conn[p].Close()
-			}
-			c.mu[p].Unlock()
-		}()
-
-		if err := c.sender(p); err != nil {
-			if !strings.Contains(err.Error(), "operation cancelled: sender") {
-				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
-			}
-			c.log.Error(err, "sender error")
-		}
-	}()
-
-	// 最后把 conn 写回 map，并释放细锁
+	// 步骤3：更新全局连接映射
+	c.lock.Lock()
 	c.conn[p] = conn
-	c.mu[p].Unlock()
+	c.lock.Unlock()
+
+	// 步骤4：启动协程处理收发
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Receiver
+		go func() {
+			defer wg.Done()
+			if err := c.receiver(p); err != nil {
+				if !strings.Contains(err.Error(), "operation cancelled: receiver") {
+					c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
+				}
+				c.log.Error(err, "receiver error")
+			}
+		}()
+
+		// Sender
+		go func() {
+			defer wg.Done()
+			if err := c.sender(p); err != nil {
+				if !strings.Contains(err.Error(), "operation cancelled: sender") {
+					c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
+				}
+				c.log.Error(err, "sender error")
+			}
+		}()
+
+		wg.Wait()
+
+		// 步骤5：安全清理连接
+		c.lock.Lock()
+		c.mu[p].Lock()
+		if conn := c.conn[p]; conn != nil {
+			conn.Close()
+			delete(c.conn, p)
+		}
+		c.mu[p].Unlock()
+		c.lock.Unlock()
+	}()
 
 	return nil
 }
