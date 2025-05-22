@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -282,116 +283,137 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) dial(p bool) error {
-	// 步骤1：防止同一类型并发拨号
-	c.mu[p].Lock()
-	defer c.mu[p].Unlock()
+	// 连接建立
+	c.lock.Lock()
+	if c.conn == nil {
+		c.conn = make(map[bool]*websocket.Conn)
+	}
+	if c.sendChan == nil {
+		c.sendChan = make(map[bool]chan []byte)
+	}
+	if c.lastTransmit == nil {
+		c.lastTransmit = make(map[bool]*time.Time)
+	}
+	c.lock.Unlock()
 
-	// 步骤2：建立连接
+	// p维度锁
+	if c.mu == nil {
+		c.mu = make(map[bool]*sync.RWMutex)
+	}
+	if c.mu[p] == nil {
+		c.mu[p] = &sync.RWMutex{}
+	}
+	c.mu[p].Lock()
 	conn, res, err := websocket.DefaultDialer.Dial(string(c.url[p]), nil)
 	if err != nil {
 		statusCode := 0
 		if res != nil {
 			statusCode = res.StatusCode
 		}
+		c.mu[p].Unlock()
 		return fmt.Errorf("error %d: %w", statusCode, err)
 	}
-	if res != nil {
-		defer res.Body.Close()
-	}
+	defer res.Body.Close()
 
-	// 步骤3：更新全局连接映射
+	// 存conn
 	c.lock.Lock()
 	c.conn[p] = conn
 	c.lock.Unlock()
+	c.mu[p].Unlock()
 
-	// 步骤4：启动协程处理收发
+	// 启动receiver
 	go func() {
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// Receiver
-		go func() {
-			defer wg.Done()
-			if err := c.receiver(p); err != nil {
-				if !strings.Contains(err.Error(), "operation cancelled: receiver") {
-					c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
-				}
-				c.log.Error(err, "receiver error")
+		defer func() {
+			c.Cancel()
+			c.mu[p].Lock()
+			c.lock.Lock()
+			if c.conn[p] != nil {
+				c.conn[p].Close()
+				delete(c.conn, p)
 			}
+			c.lock.Unlock()
+			c.mu[p].Unlock()
 		}()
-
-		// Sender
-		go func() {
-			defer wg.Done()
-			if err := c.sender(p); err != nil {
-				if !strings.Contains(err.Error(), "operation cancelled: sender") {
-					c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
-				}
-				c.log.Error(err, "sender error")
+		if err := c.receiver(p); err != nil {
+			if !strings.Contains(err.Error(), "operation cancelled: receiver") {
+				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
 			}
-		}()
-
-		wg.Wait()
-
-		// 步骤5：安全清理连接
-		c.lock.Lock()
-		c.mu[p].Lock()
-		if conn := c.conn[p]; conn != nil {
-			conn.Close()
-			delete(c.conn, p)
+			c.log.Error(err, "receiver error")
 		}
-		c.mu[p].Unlock()
-		c.lock.Unlock()
+	}()
+
+	// 启动sender
+	go func() {
+		defer func() {
+			c.Cancel()
+			c.mu[p].Lock()
+			c.lock.Lock()
+			if c.conn[p] != nil {
+				c.conn[p].Close()
+				delete(c.conn, p)
+			}
+			c.lock.Unlock()
+			c.mu[p].Unlock()
+		}()
+		if err := c.sender(p); err != nil {
+			if !strings.Contains(err.Error(), "operation cancelled: sender") {
+				c.ErrChan <- &events.Error{Event: "error", Msg: err.Error()}
+			}
+			c.log.Error(err, "sender error")
+		}
 	}()
 
 	return nil
 }
 
 func (c *ClientWs) sender(p bool) error {
-	ticker := time.NewTicker(time.Millisecond * 300)
+	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
 	for {
-		c.mu[p].RLock()
+		c.lock.RLock()
 		dataChan := c.sendChan[p]
-		c.mu[p].RUnlock()
+		c.lock.RUnlock()
 
 		select {
 		case data := <-dataChan:
-			c.mu[p].RLock()
-			err := c.conn[p].SetWriteDeadline(time.Now().Add(writeWait))
-			if err != nil {
-				c.mu[p].RUnlock()
-				return fmt.Errorf("failed to set write deadline for ws connection, error: %w", err)
+			c.lock.RLock()
+			conn := c.conn[p]
+			c.lock.RUnlock()
+			if conn == nil {
+				return errors.New("conn is nil")
 			}
-
-			w, err := c.conn[p].NextWriter(websocket.TextMessage)
+			err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err != nil {
-				c.mu[p].RUnlock()
-				return fmt.Errorf("failed to get next writer for ws connection, error: %w", err)
+				return err
 			}
-
+			w, err := conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return err
+			}
 			if _, err = w.Write(data); err != nil {
-				c.mu[p].RUnlock()
-				return fmt.Errorf("failed to write data via ws connection, error: %w", err)
+				return err
 			}
-
-			c.mu[p].RUnlock()
-
 			if err := w.Close(); err != nil {
-				return fmt.Errorf("failed to close ws connection, error: %w", err)
+				return err
 			}
 		case <-ticker.C:
-			c.mu[p].RLock()
-			if c.conn[p] != nil && (c.lastTransmit[p] == nil || (c.lastTransmit[p] != nil && time.Since(*c.lastTransmit[p]) > PingPeriod)) {
+			c.lock.RLock()
+			conn := c.conn[p]
+			last := c.lastTransmit[p]
+			c.lock.RUnlock()
+			if conn != nil && (last == nil || (last != nil && time.Since(*last) > time.Second*5)) {
 				go func() {
-					c.sendChan[p] <- []byte("ping")
+					c.lock.RLock()
+					dataChan := c.sendChan[p]
+					c.lock.RUnlock()
+					if dataChan != nil {
+						dataChan <- []byte("ping")
+					}
 				}()
 			}
-
-			c.mu[p].RUnlock()
 		case <-c.ctx.Done():
-			return c.handleCancel("sender")
+			return nil
 		}
 	}
 }
@@ -400,31 +422,30 @@ func (c *ClientWs) receiver(p bool) error {
 	for {
 		select {
 		case <-c.ctx.Done():
-			return c.handleCancel("receiver")
+			return nil
 		default:
-			c.mu[p].RLock()
-			err := c.conn[p].SetReadDeadline(time.Now().Add(pongWait))
-			if err != nil {
-				c.mu[p].RUnlock()
-				return fmt.Errorf("failed to set read deadline for ws connection, error: %w", err)
+			c.lock.RLock()
+			conn := c.conn[p]
+			c.lock.RUnlock()
+			if conn == nil {
+				return errors.New("conn is nil")
 			}
-
-			mt, data, err := c.conn[p].ReadMessage()
+			err := conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			if err != nil {
-				c.mu[p].RUnlock()
-				return fmt.Errorf("failed to read message from ws connection, error: %w", err)
+				return err
 			}
-			c.mu[p].RUnlock()
-
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				return err
+			}
 			now := time.Now()
-			c.mu[p].Lock()
+			c.lock.Lock()
 			c.lastTransmit[p] = &now
-			c.mu[p].Unlock()
-
+			c.lock.Unlock()
 			if mt == websocket.TextMessage && string(data) != "pong" {
 				e := &events.Basic{}
 				if err := json.Unmarshal(data, e); err != nil {
-					return fmt.Errorf("failed to unmarshall message from ws, error: %w", err)
+					return err
 				}
 				go c.process(data, e)
 			}
