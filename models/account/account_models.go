@@ -47,6 +47,11 @@ type (
 		StgyEq        okex.JSONFloat64 `json:"stgyEq"`
 		IsoUpl        okex.JSONFloat64 `json:"isoUpl,omitempty"`
 		UTime         okex.JSONTime    `json:"uTime"`
+		AccAvgPx      okex.JSONFloat64 `json:"accAvgPx,omitempty"`
+		SpotUpl       okex.JSONFloat64 `json:"spotUpl,omitempty"`
+		SpotUplRatio  okex.JSONFloat64 `json:"spotUplRatio,omitempty"`
+		TotalPnl      okex.JSONFloat64 `json:"totalPnl,omitempty"`
+		TotalPnlRatio okex.JSONFloat64 `json:"totalPnlRatio,omitempty"`
 	}
 	Position struct {
 		InstID      string              `json:"instId"`
