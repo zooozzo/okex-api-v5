@@ -7,6 +7,7 @@ import (
 type (
 	Balance struct {
 		TotalEq     okex.JSONFloat64  `json:"totalEq"`
+		AvailEq     okex.JSONFloat64  `json:"availEq,omitempty"`
 		IsoEq       okex.JSONFloat64  `json:"isoEq"`
 		AdjEq       okex.JSONFloat64  `json:"adjEq,omitempty"`
 		OrdFroz     okex.JSONFloat64  `json:"ordFroz,omitempty"`
@@ -14,6 +15,7 @@ type (
 		Mmr         okex.JSONFloat64  `json:"mmr,omitempty"`
 		MgnRatio    okex.JSONFloat64  `json:"mgnRatio,omitempty"`
 		NotionalUsd okex.JSONFloat64  `json:"notionalUsd,omitempty"`
+		Upl         okex.JSONFloat64  `json:"upl,omitempty"`
 		Details     []*BalanceDetails `json:"details,omitempty"`
 		UTime       okex.JSONTime     `json:"uTime"`
 	}
